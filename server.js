@@ -88,10 +88,16 @@ function normalizePhone(phone) {
 app.get('/', (req, res) => {
   const missing = requiredEnv();
   res.json({
-    service: 'COBRA FX M-Pesa API',
-    env: DARAJA_ENV,
-    ready: missing.length === 0,
-    missing: missing.length ? missing : undefined
+    service: 'COBRA FX Payments API',
+    mpesa: {
+      env: DARAJA_ENV,
+      ready: missing.length === 0,
+      missing: missing.length ? missing : undefined
+    },
+    stripe: {
+      ready: !!process.env.STRIPE_SECRET_KEY,
+      mode: (process.env.STRIPE_SECRET_KEY || '').startsWith('sk_live') ? 'live' : 'test'
+    }
   });
 });
 
@@ -248,13 +254,256 @@ app.get('/api/deposit/status/:id', (req, res) => {
   });
 });
 
+// ========== B2C WITHDRAW (M-Pesa to phone) ==========
+const {
+  DARAJA_INITIATOR_NAME,
+  DARAJA_SECURITY_CREDENTIAL,
+  DARAJA_RESULT_URL,
+  DARAJA_TIMEOUT_URL
+} = process.env;
+
+const pendingWithdrawals = new Map();
+
+/**
+ * Send money to customer phone (B2C)
+ * POST /api/withdraw/mpesa
+ * Body: { phone, amount, userId? }
+ *
+ * Railway vars required:
+ *   DARAJA_INITIATOR_NAME
+ *   DARAJA_SECURITY_CREDENTIAL  (encrypted initiator password from Daraja)
+ *   DARAJA_RESULT_URL           e.g. https://xxx.up.railway.app/mpesa/b2c/result
+ *   DARAJA_TIMEOUT_URL          e.g. https://xxx.up.railway.app/mpesa/b2c/timeout
+ */
+app.post('/api/withdraw/mpesa', async (req, res) => {
+  if (!DARAJA_INITIATOR_NAME || !DARAJA_SECURITY_CREDENTIAL) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        'B2C not configured. Add DARAJA_INITIATOR_NAME and DARAJA_SECURITY_CREDENTIAL on Railway. Enable B2C on Daraja first.'
+    });
+  }
+
+  const resultUrl =
+    DARAJA_RESULT_URL ||
+    (DARAJA_CALLBACK_URL || '').replace('/mpesa/callback', '/mpesa/b2c/result');
+  const timeoutUrl =
+    DARAJA_TIMEOUT_URL ||
+    (DARAJA_CALLBACK_URL || '').replace('/mpesa/callback', '/mpesa/b2c/timeout');
+
+  try {
+    const { phone, amount, userId } = req.body || {};
+    const amt = Math.round(Number(amount));
+    const msisdn = normalizePhone(phone || '');
+
+    if (!msisdn || msisdn.length < 12) {
+      return res.status(400).json({ ok: false, error: 'Valid phone required' });
+    }
+    if (!amt || amt < 1) {
+      return res.status(400).json({ ok: false, error: 'Amount must be at least 1' });
+    }
+
+    const token = await getAccessToken();
+
+    const payload = {
+      InitiatorName: DARAJA_INITIATOR_NAME,
+      SecurityCredential: DARAJA_SECURITY_CREDENTIAL,
+      CommandID: 'BusinessPayment',
+      Amount: amt,
+      PartyA: DARAJA_SHORTCODE,
+      PartyB: msisdn,
+      Remarks: 'COBRA FX Withdrawal',
+      QueueTimeOutURL: timeoutUrl,
+      ResultURL: resultUrl,
+      Occasion: 'Withdrawal'
+    };
+
+    const b2cRes = await axios.post(
+      `${DARAJA_BASE}/mpesa/b2c/v1/paymentrequest`,
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    const data = b2cRes.data;
+    console.log('B2C response:', JSON.stringify(data));
+
+    if (data.ConversationID || data.OriginatorConversationID) {
+      pendingWithdrawals.set(data.ConversationID || data.OriginatorConversationID, {
+        phone: msisdn,
+        amount: amt,
+        userId: userId || null,
+        status: 'pending',
+        createdAt: new Date().toISOString()
+      });
+    }
+
+    if (data.ResponseCode === '0') {
+      return res.json({
+        ok: true,
+        message: 'Withdrawal submitted to M-Pesa',
+        conversationId: data.ConversationID,
+        originatorConversationId: data.OriginatorConversationID
+      });
+    }
+
+    return res.status(400).json({
+      ok: false,
+      error: data.ResponseDescription || data.errorMessage || 'B2C request failed',
+      raw: data
+    });
+  } catch (err) {
+    const msg =
+      err.response?.data?.errorMessage ||
+      err.response?.data?.ResponseDescription ||
+      err.message;
+    console.error('B2C error:', err.response?.data || err.message);
+    return res.status(500).json({ ok: false, error: msg });
+  }
+});
+
+app.post('/mpesa/b2c/result', (req, res) => {
+  console.log('B2C result:', JSON.stringify(req.body, null, 2));
+  try {
+    const rs = req.body?.Result;
+    if (rs) {
+      const id = rs.ConversationID || rs.OriginatorConversationID;
+      const rec = pendingWithdrawals.get(id);
+      if (rec) {
+        rec.status = rs.ResultCode === 0 ? 'completed' : 'failed';
+        rec.resultDesc = rs.ResultDesc;
+        pendingWithdrawals.set(id, rec);
+        console.log(rs.ResultCode === 0 ? 'WITHDRAW SUCCESS' : 'WITHDRAW FAILED', rec);
+      }
+    }
+  } catch (e) {
+    console.error('B2C result parse:', e.message);
+  }
+  res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+});
+
+app.post('/mpesa/b2c/timeout', (req, res) => {
+  console.log('B2C timeout:', JSON.stringify(req.body));
+  res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+});
+
+// ========== STRIPE (cards) ==========
+const Stripe = require('stripe');
+const stripeSecret = process.env.STRIPE_SECRET_KEY || '';
+const stripe = stripeSecret ? new Stripe(stripeSecret) : null;
+
+// Where user returns after paying (your trading site)
+const SITE_URL = process.env.SITE_URL || 'https://devkisteelmills.co.ke';
+
+/**
+ * Create Stripe Checkout Session
+ * POST /api/deposit/card
+ * Body: { amount: 50, userId?: string }
+ * amount is in USD dollars (we charge in cents)
+ */
+app.post('/api/deposit/card', async (req, res) => {
+  if (!stripe) {
+    return res.status(500).json({
+      error: 'Stripe not configured. Add STRIPE_SECRET_KEY on Railway.'
+    });
+  }
+
+  try {
+    const { amount, userId } = req.body || {};
+    const dollars = Number(amount);
+    if (!dollars || dollars < 1) {
+      return res.status(400).json({ error: 'Minimum amount is 1 USD' });
+    }
+
+    const cents = Math.round(dollars * 100);
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: 'COBRA FX Deposit',
+              description: 'Account funding'
+            },
+            unit_amount: cents
+          },
+          quantity: 1
+        }
+      ],
+      metadata: {
+        userId: userId || 'web',
+        amountUsd: String(dollars)
+      },
+      success_url:
+        SITE_URL +
+        '/dashboard.html?stripe=success&session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: SITE_URL + '/dashboard.html?stripe=cancel'
+    });
+
+    return res.json({
+      ok: true,
+      url: session.url,
+      sessionId: session.id
+    });
+  } catch (err) {
+    console.error('Stripe session error:', err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * Confirm a Checkout Session was paid
+ * GET /api/deposit/card/status?session_id=cs_...
+ */
+app.get('/api/deposit/card/status', async (req, res) => {
+  if (!stripe) {
+    return res.status(500).json({ error: 'Stripe not configured' });
+  }
+
+  try {
+    const sessionId = req.query.session_id;
+    if (!sessionId) {
+      return res.status(400).json({ error: 'session_id required' });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    if (session.payment_status === 'paid') {
+      const amountUsd =
+        session.metadata?.amountUsd ||
+        (session.amount_total != null ? session.amount_total / 100 : null);
+      return res.json({
+        status: 'completed',
+        amount: amountUsd,
+        sessionId: session.id
+      });
+    }
+
+    return res.json({
+      status: session.payment_status || 'pending',
+      amount: session.metadata?.amountUsd || null
+    });
+  } catch (err) {
+    console.error('Stripe status error:', err.message);
+    return res.status(500).json({ status: 'error', error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
-  console.log(`COBRA FX M-Pesa API on port ${PORT}`);
-  console.log(`Env: ${DARAJA_ENV}`);
+  console.log(`COBRA FX Payments API on port ${PORT}`);
+  console.log(`M-Pesa env: ${DARAJA_ENV}`);
+  console.log(`Stripe: ${stripe ? 'configured' : 'NOT set'}`);
   const missing = requiredEnv();
   if (missing.length) {
-    console.warn('Missing env vars:', missing.join(', '));
+    console.warn('M-Pesa missing env:', missing.join(', '));
   } else {
-    console.log('Config OK — ready for STK Push');
+    console.log('M-Pesa config OK');
   }
 });

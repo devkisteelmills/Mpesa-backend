@@ -1,7 +1,7 @@
 {
   "name": "cobrafx-mpesa-backend",
-  "version": "1.0.0",
-  "description": "COBRA FX M-Pesa STK Push backend (Safaricom Daraja Sandbox)",
+  "version": "1.1.0",
+  "description": "COBRA FX payments: M-Pesa (Daraja) + Stripe cards",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -13,6 +13,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
-    "axios": "^1.7.7"
+    "axios": "^1.7.7",
+    "stripe": "^16.12.0"
   }
 }
