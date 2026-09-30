@@ -97,6 +97,11 @@ app.get('/', (req, res) => {
     stripe: {
       ready: !!process.env.STRIPE_SECRET_KEY,
       mode: (process.env.STRIPE_SECRET_KEY || '').startsWith('sk_live') ? 'live' : 'test'
+    },
+    pesapal: {
+      ready: !!(process.env.PESAPAL_CONSUMER_KEY && process.env.PESAPAL_CONSUMER_SECRET),
+      env: process.env.PESAPAL_ENV || 'sandbox',
+      ipnConfigured: !!process.env.PESAPAL_IPN_ID
     }
   });
 });
@@ -496,10 +501,266 @@ app.get('/api/deposit/card/status', async (req, res) => {
   }
 });
 
+// ========== PESAPAL (cards + mobile money) ==========
+const {
+  PESAPAL_CONSUMER_KEY,
+  PESAPAL_CONSUMER_SECRET,
+  PESAPAL_ENV = 'sandbox', // sandbox | live
+  PESAPAL_IPN_ID
+} = process.env;
+
+const PESAPAL_BASE =
+  PESAPAL_ENV === 'live'
+    ? 'https://pay.pesapal.com/v3'
+    : 'https://cybqa.pesapal.com/pesapalv3';
+
+let pesapalTokenCache = { token: null, expires: 0 };
+const pendingPesapal = new Map(); // orderTrackingId -> { amount, userId, status }
+
+async function getPesapalToken() {
+  if (!PESAPAL_CONSUMER_KEY || !PESAPAL_CONSUMER_SECRET) {
+    throw new Error('Pesapal keys not configured');
+  }
+  if (pesapalTokenCache.token && Date.now() < pesapalTokenCache.expires) {
+    return pesapalTokenCache.token;
+  }
+  const res = await axios.post(
+    `${PESAPAL_BASE}/api/Auth/RequestToken`,
+    {
+      consumer_key: PESAPAL_CONSUMER_KEY,
+      consumer_secret: PESAPAL_CONSUMER_SECRET
+    },
+    { headers: { Accept: 'application/json', 'Content-Type': 'application/json' } }
+  );
+  const token = res.data.token;
+  if (!token) throw new Error(res.data.error?.message || 'No Pesapal token');
+  // token ~5 min; refresh a bit early
+  pesapalTokenCache = { token, expires: Date.now() + 4 * 60 * 1000 };
+  return token;
+}
+
+/** Register IPN once — call GET /api/pesapal/register-ipn after deploy */
+app.post('/api/pesapal/register-ipn', async (req, res) => {
+  try {
+    const token = await getPesapalToken();
+    const ipnUrl =
+      req.body?.url ||
+      `${process.env.RAILWAY_PUBLIC_DOMAIN ? 'https://' + process.env.RAILWAY_PUBLIC_DOMAIN : ''}` ||
+      (DARAJA_CALLBACK_URL || '').replace('/mpesa/callback', '/pesapal/ipn');
+
+    const url =
+      ipnUrl && ipnUrl.startsWith('http')
+        ? ipnUrl
+        : 'https://mpesa-backend-production-ae40.up.railway.app/pesapal/ipn';
+
+    const reg = await axios.post(
+      `${PESAPAL_BASE}/api/URLSetup/RegisterIPN`,
+      { url, ipn_notification_type: 'GET' },
+      {
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        }
+      }
+    );
+
+    console.log('Pesapal IPN register:', reg.data);
+    return res.json({
+      ok: true,
+      ipn_id: reg.data.ipn_id,
+      url: reg.data.url,
+      message: 'Save PESAPAL_IPN_ID on Railway to this ipn_id value'
+    });
+  } catch (err) {
+    console.error('Pesapal IPN error:', err.response?.data || err.message);
+    return res.status(500).json({
+      ok: false,
+      error: err.response?.data?.error?.message || err.message,
+      raw: err.response?.data
+    });
+  }
+});
+
+/**
+ * Start Pesapal checkout (card / mobile money on Pesapal page)
+ * POST /api/deposit/pesapal
+ * Body: { amount, currency?, email?, phone?, userId? }
+ * amount in major units (KES or USD depending on currency)
+ */
+app.post('/api/deposit/pesapal', async (req, res) => {
+  if (!PESAPAL_CONSUMER_KEY || !PESAPAL_CONSUMER_SECRET) {
+    return res.status(500).json({
+      ok: false,
+      error: 'Pesapal not configured. Add PESAPAL_CONSUMER_KEY and PESAPAL_CONSUMER_SECRET on Railway.'
+    });
+  }
+
+  try {
+    const { amount, currency = 'KES', email, phone, userId, firstName, lastName } = req.body || {};
+    const amt = Number(amount);
+    if (!amt || amt < 1) {
+      return res.status(400).json({ ok: false, error: 'Minimum amount is 1' });
+    }
+
+    const token = await getPesapalToken();
+    const merchantRef = 'CFX-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+
+    const notificationId = PESAPAL_IPN_ID;
+    if (!notificationId) {
+      return res.status(500).json({
+        ok: false,
+        error: 'PESAPAL_IPN_ID missing. Call POST /api/pesapal/register-ipn first, then save ipn_id on Railway.'
+      });
+    }
+
+    const callbackUrl = (SITE_URL || 'https://devkisteelmills.co.ke') + '/dashboard.html?pesapal=return';
+
+    const orderPayload = {
+      id: merchantRef,
+      currency: currency,
+      amount: amt,
+      description: 'COBRA FX Deposit',
+      callback_url: callbackUrl,
+      notification_id: notificationId,
+      billing_address: {
+        email_address: email || 'trader@cobrafx.com',
+        phone_number: phone || '0700000000',
+        country_code: 'KE',
+        first_name: firstName || 'COBRA',
+        last_name: lastName || 'FX'
+      }
+    };
+
+    const orderRes = await axios.post(
+      `${PESAPAL_BASE}/api/Transactions/SubmitOrderRequest`,
+      orderPayload,
+      {
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        }
+      }
+    );
+
+    const data = orderRes.data;
+    if (!data.redirect_url) {
+      return res.status(400).json({
+        ok: false,
+        error: data.error?.message || 'No redirect_url from Pesapal',
+        raw: data
+      });
+    }
+
+    pendingPesapal.set(data.order_tracking_id, {
+      amount: amt,
+      currency,
+      userId: userId || 'web',
+      merchantRef,
+      status: 'pending',
+      createdAt: new Date().toISOString()
+    });
+
+    return res.json({
+      ok: true,
+      url: data.redirect_url,
+      orderTrackingId: data.order_tracking_id,
+      merchantReference: data.merchant_reference || merchantRef
+    });
+  } catch (err) {
+    console.error('Pesapal order error:', err.response?.data || err.message);
+    return res.status(500).json({
+      ok: false,
+      error: err.response?.data?.error?.message || err.message,
+      raw: err.response?.data
+    });
+  }
+});
+
+/** IPN from Pesapal */
+app.get('/pesapal/ipn', async (req, res) => {
+  console.log('Pesapal IPN query:', req.query);
+  try {
+    const orderTrackingId = req.query.OrderTrackingId || req.query.orderTrackingId;
+    if (orderTrackingId) {
+      await refreshPesapalStatus(orderTrackingId);
+    }
+  } catch (e) {
+    console.error('Pesapal IPN handle:', e.message);
+  }
+  res.json({ orderNotificationType: 'IPNCHANGE', orderTrackingId: req.query.OrderTrackingId, status: 200 });
+});
+
+app.post('/pesapal/ipn', async (req, res) => {
+  console.log('Pesapal IPN body:', req.body);
+  try {
+    const orderTrackingId =
+      req.body?.OrderTrackingId || req.body?.order_tracking_id || req.query.OrderTrackingId;
+    if (orderTrackingId) await refreshPesapalStatus(orderTrackingId);
+  } catch (e) {
+    console.error('Pesapal IPN POST:', e.message);
+  }
+  res.json({ status: 200 });
+});
+
+async function refreshPesapalStatus(orderTrackingId) {
+  const token = await getPesapalToken();
+  const st = await axios.get(
+    `${PESAPAL_BASE}/api/Transactions/GetTransactionStatus?orderTrackingId=${encodeURIComponent(orderTrackingId)}`,
+    {
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${token}`
+      }
+    }
+  );
+  console.log('Pesapal status:', st.data);
+  const rec = pendingPesapal.get(orderTrackingId) || { amount: st.data.amount };
+  // status_code: 1 = COMPLETED (check Pesapal docs)
+  const code = st.data.status_code;
+  if (code === 1 || String(st.data.payment_status_description || '').toUpperCase() === 'COMPLETED') {
+    rec.status = 'completed';
+    rec.amount = st.data.amount || rec.amount;
+    console.log('PESAPAL PAYMENT SUCCESS', rec);
+  } else if (code === 2 || code === 999) {
+    rec.status = 'failed';
+    console.log('PESAPAL PAYMENT FAILED', rec);
+  } else {
+    rec.status = 'pending';
+  }
+  pendingPesapal.set(orderTrackingId, rec);
+  return rec;
+}
+
+app.get('/api/deposit/pesapal/status', async (req, res) => {
+  try {
+    const id = req.query.orderTrackingId;
+    if (!id) return res.status(400).json({ error: 'orderTrackingId required' });
+    let rec = pendingPesapal.get(id);
+    if (!rec || rec.status === 'pending') {
+      rec = await refreshPesapalStatus(id);
+    }
+    return res.json({
+      status: rec.status,
+      amount: rec.amount,
+      currency: rec.currency
+    });
+  } catch (err) {
+    return res.status(500).json({
+      status: 'error',
+      error: err.response?.data?.error?.message || err.message
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`COBRA FX Payments API on port ${PORT}`);
   console.log(`M-Pesa env: ${DARAJA_ENV}`);
   console.log(`Stripe: ${stripe ? 'configured' : 'NOT set'}`);
+  console.log(
+    `Pesapal: ${PESAPAL_CONSUMER_KEY ? 'keys set (' + PESAPAL_ENV + ')' : 'NOT set'}`
+  );
   const missing = requiredEnv();
   if (missing.length) {
     console.warn('M-Pesa missing env:', missing.join(', '));
